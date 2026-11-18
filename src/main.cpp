@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <climits>
+#include <deque>
+#include <mutex>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -17,6 +19,7 @@
 #include "i18n.h"
 #include "labels.h"
 #include "report.h"
+#include "settings.h"
 #include "widget.h"
 
 namespace {
@@ -24,6 +27,8 @@ namespace {
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT WM_RESULTS = WM_APP + 2;
 constexpr UINT WM_WIDGET_CLICK = WM_APP + 3;
+constexpr UINT WM_SETTINGS = WM_APP + 4;       // lParam: std::vector<SettingsDevice>* from the settings worker
+constexpr UINT WM_SETTINGS_ERROR = WM_APP + 5; // lParam: std::wstring* error of a failed write
 constexpr UINT_PTR TIMER_DEBOUNCE = 1;
 constexpr UINT_PTR TIMER_WIDGET = 2;
 constexpr DWORD POLL_INTERVAL_MS = 60 * 1000;
@@ -35,9 +40,12 @@ enum MenuId : UINT {
     ID_BRAND_COLORS, ID_STACKED,
     ID_LANG_AUTO = 400, ID_LANG_ADD, ID_LANG_FIRST,  // "Language": ID_LANG_FIRST + 0..63
     ID_MONITOR_ALL = 300, ID_MONITOR_MAIN, ID_MONITOR_FIRST,  // "Show the widget on": ID_MONITOR_FIRST + 0..31
-    ID_DEVICE_FIRST = 1000
+    ID_DEVICE_FIRST = 1000,
+    ID_SET_FIRST = 6000  // mouse settings: ID_SET_FIRST + mouse * SET_STRIDE + SetCmd
 };
 enum DeviceCmd : UINT { DEV_TOGGLE, DEV_LEFT, DEV_RIGHT, DEV_STRIDE = 4 };
+// Per mouse: DPI presets at 0..SET_DPI_OTHER-1, "Other value..." at SET_DPI_OTHER, polling rates from SET_RATE_FIRST.
+enum SetCmd : UINT { SET_DPI_OTHER = 31, SET_RATE_FIRST = 32, SET_STRIDE = 64 };
 
 const wchar_t* kAppName = L"Wireless Battery";
 const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -617,6 +625,141 @@ void MoveEntry(const std::wstring& key, int dir) {
     UpdateWidget();
 }
 
+// ---- mouse settings ---------------------------------------------------------------------------
+// A separate worker reads DPI / polling rate only when asked (device arrival, resume, Refresh now,
+// menu opened) and performs writes the user picked. It sleeps on an event otherwise: no idle cost.
+
+bool g_demo = false;  // `--demo`: sample devices instead of real ones (see DemoDevices)
+
+struct SettingsOp { SettingsDevice dev; bool dpi = true; int value = 0; };
+
+std::vector<SettingsDevice> g_settings;  // UI thread copy of the last read
+HANDLE g_settingsEvt, g_settingsWorker;
+std::mutex g_opsLock;
+std::deque<SettingsOp> g_ops;            // pending writes, guarded by g_opsLock
+bool g_settingsBusy = false;             // UI thread: a write is queued, its menu items are disabled
+
+void RequestSettingsRead() { if (g_settingsEvt) SetEvent(g_settingsEvt); }
+
+DWORD WINAPI SettingsWorker(LPVOID) {
+    HANDLE events[2] = { g_stopEvt, g_settingsEvt };
+    if (WaitForSingleObject(g_stopEvt, 4000) == WAIT_OBJECT_0) return 0;  // let receivers settle after sign-in
+    for (;;) {
+        for (;;) {
+            SettingsOp op;
+            {
+                std::lock_guard<std::mutex> lock(g_opsLock);
+                if (g_ops.empty()) break;
+                op = g_ops.front();
+                g_ops.pop_front();
+            }
+            std::wstring err;
+            bool ok = op.dpi ? ApplyDpi(op.dev, op.value, err) : ApplyPolling(op.dev, op.value, err);
+            // A failure, or a success with a note (e.g. "applied now, stored at next power-on"), is shown once.
+            if (!ok || !err.empty()) {
+                auto* e = new std::wstring(op.dev.name + L": " + (err.empty() ? std::wstring(L"write failed") : err));
+                if (!PostMessageW(g_hwnd, WM_SETTINGS_ERROR, ok ? 1 : 0, (LPARAM)e)) delete e;
+            }
+        }
+        auto* v = new std::vector<SettingsDevice>(g_demo ? std::vector<SettingsDevice>{} : EnumSettingsDevices());
+        if (!PostMessageW(g_hwnd, WM_SETTINGS, 0, (LPARAM)v)) delete v;
+        if (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0) return 0;
+    }
+}
+
+void QueueSettingsWrite(const SettingsDevice& d, bool dpi, int value) {
+    {
+        std::lock_guard<std::mutex> lock(g_opsLock);
+        g_ops.push_back({ d, dpi, value });
+    }
+    g_settingsBusy = true;
+    RequestSettingsRead();
+}
+
+// DPI presets shown in the menu: common values inside the mouse's range, plus the current value.
+std::vector<int> DpiPresets(const SettingsDevice& d) {
+    std::vector<int> v;
+    for (int p : { 400, 800, 1200, 1600, 3200 })
+        if (p >= d.caps.dpiMin && p <= d.caps.dpiMax) v.push_back(p);
+    if (d.dpi > 0 && std::find(v.begin(), v.end(), d.dpi) == v.end()) v.push_back(d.dpi);
+    std::sort(v.begin(), v.end());
+    if (v.size() > SET_DPI_OTHER) v.resize(SET_DPI_OTHER);
+    return v;
+}
+
+// Small modal dialog asking for a DPI value, built in memory (no resource script needed).
+struct DpiDialogData { int min, max, step, value; };
+
+INT_PTR CALLBACK DpiDialogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* d = reinterpret_cast<DpiDialogData*>(GetWindowLongPtrW(dlg, DWLP_USER));
+    switch (msg) {
+        case WM_INITDIALOG: {
+            SetWindowLongPtrW(dlg, DWLP_USER, lp);
+            d = reinterpret_cast<DpiDialogData*>(lp);
+            SetWindowTextW(dlg, T(L"DPI"));
+            std::wstring range = TF(L"Value from {min} to {max}, in steps of {step}:",
+                                    { { L"min", std::to_wstring(d->min) }, { L"max", std::to_wstring(d->max) },
+                                      { L"step", std::to_wstring(d->step) } });
+            SetDlgItemTextW(dlg, 100, range.c_str());
+            if (d->value > 0) SetDlgItemInt(dlg, 101, (UINT)d->value, FALSE);
+            SetDlgItemTextW(dlg, IDOK, T(L"OK"));
+            SetDlgItemTextW(dlg, IDCANCEL, T(L"Cancel"));
+            SendDlgItemMessageW(dlg, 101, EM_SETLIMITTEXT, 6, 0);
+            return TRUE;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wp) == IDOK) {
+                BOOL ok = FALSE;
+                int v = (int)GetDlgItemInt(dlg, 101, &ok, FALSE);
+                int step = d->step > 0 ? d->step : 1;
+                if (!ok || v < d->min || v > d->max || (v - d->min) % step != 0) {
+                    MessageBeep(MB_ICONWARNING);
+                    SetFocus(GetDlgItem(dlg, 101));
+                    SendDlgItemMessageW(dlg, 101, EM_SETSEL, 0, -1);
+                    return TRUE;
+                }
+                d->value = v;
+                EndDialog(dlg, IDOK);
+                return TRUE;
+            }
+            if (LOWORD(wp) == IDCANCEL) { EndDialog(dlg, IDCANCEL); return TRUE; }
+            break;
+    }
+    return FALSE;
+}
+
+int AskDpi(const SettingsDevice& dev) {
+    // DLGTEMPLATE + 4 items, WORD-aligned, items DWORD-aligned.
+    std::vector<WORD> t;
+    auto align = [&] { if (t.size() % 2) t.push_back(0); };
+    auto str = [&](const wchar_t* s) { for (; *s; s++) t.push_back(*s); t.push_back(0); };
+    auto dw = [&](DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); };
+    dw(DS_MODALFRAME | DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
+    dw(0);
+    t.push_back(4);                          // items
+    t.push_back(0); t.push_back(0); t.push_back(200); t.push_back(66);
+    t.push_back(0); t.push_back(0);          // no menu, default class
+    str(L"DPI");
+    t.push_back(9); str(L"Segoe UI");
+    auto item = [&](DWORD style, short x, short y, short cx, short cy, WORD id, WORD cls) {
+        align();
+        dw(style | WS_CHILD | WS_VISIBLE);
+        dw(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls);
+        t.push_back(0);                      // no text (set in WM_INITDIALOG)
+        t.push_back(0);                      // no creation data
+    };
+    item(SS_LEFT, 7, 7, 186, 18, 100, 0x0082);
+    item(ES_NUMBER | ES_LEFT | WS_BORDER | WS_TABSTOP, 7, 26, 186, 13, 101, 0x0081);
+    item(BS_DEFPUSHBUTTON | WS_TABSTOP, 89, 45, 50, 14, IDOK, 0x0080);
+    item(BS_PUSHBUTTON | WS_TABSTOP, 143, 45, 50, 14, IDCANCEL, 0x0080);
+    DpiDialogData data{ dev.caps.dpiMin, dev.caps.dpiMax, dev.caps.dpiStep, dev.dpi };
+    INT_PTR r = DialogBoxIndirectParamW(g_inst, reinterpret_cast<LPCDLGTEMPLATEW>(t.data()), g_hwnd, DpiDialogProc,
+                                        (LPARAM)&data);
+    return r == IDOK ? data.value : -1;
+}
+
 void ShowMenu() {
     ApplyMenuTheme(g_lightTaskbar);
     HMENU m = CreatePopupMenu();
@@ -641,6 +784,51 @@ void ShowMenu() {
         keys.push_back(k);
     }
     AppendMenuW(m, MF_STRING | (g_hideLastKnown ? MF_CHECKED : 0), ID_HIDE_LAST_KNOWN, T(L"Hide last known / asleep devices"));
+    // Mouse settings: built from the last read; a new read starts now so the next opening is current.
+    std::vector<SettingsDevice> mice = g_settings;
+    if (mice.size() > 32) mice.resize(32);
+    std::vector<std::vector<int>> presets;
+    if (!mice.empty()) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    for (UINT i = 0; i < mice.size(); i++) {
+        const SettingsDevice& d = mice[i];
+        UINT base = ID_SET_FIRST + i * SET_STRIDE;
+        UINT busy = g_settingsBusy ? MF_GRAYED : 0;
+        HMENU sub = CreatePopupMenu();
+        presets.push_back(DpiPresets(d));
+        if (d.caps.dpiMax > 0) {
+            HMENU dpiMenu = CreatePopupMenu();
+            const auto& p = presets.back();
+            for (UINT j = 0; j < p.size(); j++)
+                AppendMenuW(dpiMenu, MF_STRING | busy, base + j, (std::to_wstring(p[j]) + L" DPI").c_str());
+            for (UINT j = 0; j < p.size(); j++)
+                if (p[j] == d.dpi) CheckMenuRadioItem(dpiMenu, base, base + (UINT)p.size() - 1, base + j, MF_BYCOMMAND);
+            AppendMenuW(dpiMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(dpiMenu, MF_STRING | busy, base + SET_DPI_OTHER, T(L"Other value..."));
+            AppendMenuW(sub, MF_POPUP, (UINT_PTR)dpiMenu, T(L"DPI"));
+        }
+        if (!d.caps.pollingRates.empty()) {
+            HMENU rateMenu = CreatePopupMenu();
+            UINT n = (UINT)std::min<size_t>(d.caps.pollingRates.size(), SET_STRIDE - SET_RATE_FIRST);
+            for (UINT j = 0; j < n; j++)
+                AppendMenuW(rateMenu, MF_STRING | busy, base + SET_RATE_FIRST + j,
+                            (std::to_wstring(d.caps.pollingRates[j]) + L" Hz").c_str());
+            for (UINT j = 0; j < n; j++)
+                if (d.caps.pollingRates[j] == d.pollingHz)
+                    CheckMenuRadioItem(rateMenu, base + SET_RATE_FIRST, base + SET_RATE_FIRST + n - 1, base + SET_RATE_FIRST + j, MF_BYCOMMAND);
+            AppendMenuW(sub, MF_POPUP, (UINT_PTR)rateMenu, T(L"Polling rate"));
+        }
+        if (!d.verified) {
+            AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, T(L"Not yet tested on this model"));
+        }
+        std::wstring line = d.name;
+        std::wstring now;
+        if (d.dpi > 0) now = std::to_wstring(d.dpi) + L" DPI";
+        if (d.pollingHz > 0) now += (now.empty() ? L"" : L", ") + std::to_wstring(d.pollingHz) + L" Hz";
+        if (!now.empty()) line += L":  " + now;
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, line.c_str());
+    }
+    RequestSettingsRead();
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_wantWidget ? MF_CHECKED : 0), ID_MODE_WIDGET, T(L"Show on the taskbar (icon + percentage)"));
     AppendMenuW(m, MF_STRING | (!g_wantWidget ? MF_CHECKED : 0), ID_MODE_TRAY, T(L"Show as tray icons"));
@@ -703,7 +891,7 @@ void ShowMenu() {
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
     switch (cmd) {
-        case ID_REFRESH: SetEvent(g_refreshEvt); break;
+        case ID_REFRESH: SetEvent(g_refreshEvt); RequestSettingsRead(); break;
         case ID_AUTOSTART: SetAutostart(!AutostartEnabled()); break;
         case ID_HIDE_LAST_KNOWN: SetHideLastKnown(!g_hideLastKnown); break;
         case ID_WIDGET_BACKGROUND: SetWidgetBackground(!g_widgetBackground); break;
@@ -723,6 +911,18 @@ void ShowMenu() {
                 SetLanguage(languages[cmd - ID_LANG_FIRST].code);
             } else if (cmd >= ID_MONITOR_FIRST && cmd < ID_MONITOR_FIRST + monitors.size()) {
                 SetWidgetMonitor(monitors[cmd - ID_MONITOR_FIRST].id);
+            } else if (cmd >= ID_SET_FIRST && cmd < ID_SET_FIRST + mice.size() * SET_STRIDE) {
+                UINT i = (cmd - ID_SET_FIRST) / SET_STRIDE, c = (cmd - ID_SET_FIRST) % SET_STRIDE;
+                const SettingsDevice& d = mice[i];
+                if (c == SET_DPI_OTHER) {
+                    int v = AskDpi(d);
+                    if (v > 0 && v != d.dpi) QueueSettingsWrite(d, true, v);
+                } else if (c < SET_DPI_OTHER && c < presets[i].size()) {
+                    if (presets[i][c] != d.dpi) QueueSettingsWrite(d, true, presets[i][c]);
+                } else if (c >= SET_RATE_FIRST && c - SET_RATE_FIRST < d.caps.pollingRates.size()) {
+                    int hz = d.caps.pollingRates[c - SET_RATE_FIRST];
+                    if (hz != d.pollingHz) QueueSettingsWrite(d, false, hz);
+                }
             } else if (cmd >= ID_DEVICE_FIRST && cmd < ID_DEVICE_FIRST + keys.size() * DEV_STRIDE) {
                 std::wstring key = keys[(cmd - ID_DEVICE_FIRST) / DEV_STRIDE];
                 switch ((cmd - ID_DEVICE_FIRST) % DEV_STRIDE) {
@@ -739,7 +939,6 @@ void ShowMenu() {
 // `--demo`: one sample device of every brand instead of real ones, for screenshots and for checking the
 // brand colors without owning the hardware. Keys, vendor ids and names are mixed on purpose, so every way
 // of recognising a brand gets used.
-bool g_demo = false;
 
 std::vector<DeviceStatus> DemoDevices() {
     auto make = [](const wchar_t* key, const wchar_t* name, DeviceKind kind, int pct, unsigned short vid, bool charging) {
@@ -814,6 +1013,20 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_WIDGET_CLICK:
             ShowMenu();
             return 0;
+        case WM_SETTINGS: {
+            auto* v = reinterpret_cast<std::vector<SettingsDevice>*>(lp);
+            g_settings = std::move(*v);
+            delete v;
+            std::lock_guard<std::mutex> lock(g_opsLock);
+            g_settingsBusy = !g_ops.empty();
+            return 0;
+        }
+        case WM_SETTINGS_ERROR: {
+            auto* e = reinterpret_cast<std::wstring*>(lp);
+            MessageBoxW(h, e->c_str(), T(L"Mouse settings"), MB_OK | (wp ? MB_ICONINFORMATION : MB_ICONWARNING));
+            delete e;
+            return 0;
+        }
         case WM_ENDSESSION:  // sign-out / shutdown / installer restart manager
             if (wp) DestroyWindow(h);
             return 0;
@@ -824,7 +1037,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == PBT_APMRESUMEAUTOMATIC) RefreshSoon(5000);
             return TRUE;
         case WM_TIMER:
-            if (wp == TIMER_DEBOUNCE) { KillTimer(h, TIMER_DEBOUNCE); SetEvent(g_refreshEvt); }
+            if (wp == TIMER_DEBOUNCE) { KillTimer(h, TIMER_DEBOUNCE); SetEvent(g_refreshEvt); RequestSettingsRead(); }
             if (wp == TIMER_WIDGET) Reconcile();
             return 0;
         case WM_SETTINGCHANGE:
@@ -838,6 +1051,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             widget::Destroy();
             SetEvent(g_stopEvt);
             if (g_worker) WaitForSingleObject(g_worker, 5000);
+            if (g_settingsWorker) WaitForSingleObject(g_settingsWorker, 5000);
             for (auto& [k, e] : g_entries) {
                 if (e.added) TrayDelete(e.uid);
                 if (e.icon) DestroyIcon(e.icon);
@@ -936,6 +1150,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\WirelessBatteryTray");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
+    // First run of a portable copy: start with Windows by default (can be turned off in the menu).
+    if (!g_demo && !LoadBoolSetting(L"AutostartInitialized", false)) {
+        SetAutostart(true);
+        SaveBoolSetting(L"AutostartInitialized", true);
+    }
+
     g_lightTaskbar = ReadLightTaskbar();
     ApplyMenuTheme(g_lightTaskbar);
     g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
@@ -972,6 +1192,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     UpdatePlaceholder();  // something to click on until the first poll finishes
     SetTimer(g_hwnd, TIMER_WIDGET, 1000, nullptr);
     g_worker = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
+    g_settingsEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_settingsWorker = CreateThread(nullptr, 0, SettingsWorker, nullptr, 0, nullptr);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
@@ -981,6 +1203,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     }
     // drain results posted after shutdown started
     while (PeekMessageW(&m, nullptr, WM_RESULTS, WM_RESULTS, PM_REMOVE)) delete reinterpret_cast<std::vector<DeviceStatus>*>(m.lParam);
+    while (PeekMessageW(&m, nullptr, WM_SETTINGS, WM_SETTINGS, PM_REMOVE)) delete reinterpret_cast<std::vector<SettingsDevice>*>(m.lParam);
+    while (PeekMessageW(&m, nullptr, WM_SETTINGS_ERROR, WM_SETTINGS_ERROR, PM_REMOVE)) delete reinterpret_cast<std::wstring*>(m.lParam);
+    if (g_settingsWorker) CloseHandle(g_settingsWorker);
     if (notify) UnregisterDeviceNotification(notify);
     if (g_worker) CloseHandle(g_worker);
     ReleaseMutex(mutex);

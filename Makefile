@@ -6,13 +6,13 @@ CXXFLAGS ?= -std=c++17 -Os -Wall -Wno-missing-field-initializers -ffunction-sect
 LDFLAGS  ?= -municode -mwindows -static -s -Wl,--gc-sections
 LIBS     := -lhid -lsetupapi -lcfgmgr32 -lole32 -loleaut32 -lcomctl32 -lgdi32 -lruntimeobject -lws2_32 -lwinhttp
 
-SRC := $(wildcard src/*.cpp) $(wildcard src/drivers/*.cpp)
+SRC := $(wildcard src/*.cpp) $(wildcard src/drivers/*.cpp) $(wildcard src/settings/*.cpp)
 OBJ := $(patsubst src/%.cpp,build/%.o,$(SRC)) build/app_res.o
 
 WirelessBattery.exe: $(OBJ)
 	$(CXX) $(LDFLAGS) $^ -o $@ $(LIBS)
 
-build/%.o: src/%.cpp $(wildcard src/*.h src/drivers/*.h)
+build/%.o: src/%.cpp $(wildcard src/*.h src/drivers/*.h src/settings/*.h)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -municode -c $< -o $@
 
@@ -38,6 +38,8 @@ test:
 	./build/rapoo_protocol_test.exe
 	$(CXX) $(CXXFLAGS) tests/rapoo_driver_test.cpp src/drivers/rapoo.cpp -o build/rapoo_driver_test.exe
 	./build/rapoo_driver_test.exe
+	$(CXX) -std=c++17 -O2 -Wall -Isrc tests/logitech_onboard_test.cpp src/settings/logitech_onboard.cpp -o build/logitech_onboard_test.exe
+	./build/logitech_onboard_test.exe
 	$(CXX) $(CXXFLAGS) tests/ninjutso_driver_test.cpp src/drivers/ninjutso.cpp -o build/ninjutso_driver_test.exe
 	./build/ninjutso_driver_test.exe
 	$(CXX) $(CXXFLAGS) tests/cherry_driver_test.cpp src/drivers/cherry.cpp -o build/cherry_driver_test.exe

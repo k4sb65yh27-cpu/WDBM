@@ -9,6 +9,12 @@
 [![Report a device](https://img.shields.io/badge/Report-a%20device-2EA44F?logo=github&logoColor=white)](https://github.com/krisgfx9/Wireless-Device-Battery-Monitor/issues/new)
 [![Help translate](https://img.shields.io/badge/Help-translate-6F42C1?logo=googletranslate&logoColor=white)](https://github.com/krisgfx9/Wireless-Device-Battery-Monitor/pull/129)
 
+> **WDBM fork.** This fork adds native mouse settings to the menu: DPI and polling rate, written to the
+> mouse's own memory, with no runtime and nothing running while idle. Razer and Logitech mice first.
+> The portable `WirelessBattery.exe`
+> starts with Windows after its first launch (untick *Start with Windows* to stop it). Licensing: see
+> [NOTICE.md](NOTICE.md) (AGPL-3.0-or-later for the combined program). Design: [docs/settings-design.md](docs/settings-design.md).
+
 Battery levels of your wireless mouse, headset, keyboard and controller, right on the Windows taskbar.
 
 ![Wireless Battery on the taskbar](docs/screenshot.png)
