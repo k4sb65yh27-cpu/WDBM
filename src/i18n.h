@@ -44,6 +44,9 @@ void OpenUserFolder();
 }  // namespace i18n
 
 // The translation of an English UI phrase, or the phrase itself.
+// The const wchar_t* overload is for the UI thread only (the menu reloads the phrases); from another
+// thread use the std::wstring overload or TF() (TF(L"...", {}) without placeholders), which copy the
+// phrase under a lock.
 const wchar_t* T(const wchar_t* en);
 std::wstring T(const std::wstring& en);
 // T() with named placeholders: TF(L"{name} is at {percent}%", { { L"name", n }, { L"percent", L"40" } }).

@@ -10,12 +10,13 @@
 // 0x00E5/0x00E6 and Cobra 0x00A3, which OpenMouse drives with their own protocol code.
 //
 // Columns: pid, name, transaction id, timing group, wireless receiver, max DPI (from published
-// specs, the mouse cannot report it), DPI store byte (0x01 = persistent "VARSTORE", 0x00 = NOSTORE
-// for DeathAdder V2 per OpenRazer), polling rates (0 = unused slot), extended polling command
+// specs, the mouse cannot report it), DPI store byte of the DPI read (0x01 = "VARSTORE", 0x00 =
+// NOSTORE for DeathAdder V2 per OpenRazer; writes always use VARSTORE, as OpenRazer does),
+// polling rates (0 = unused slot), extended polling command
 // (class 00 id 40/C0, divisor of 8000) instead of legacy (00/05 and 00/85, divisor of 1000),
 // commit transaction id (0 = none; second extended write with selector 0x01 that makes the rate
-// persist: devices.js extendedPollingCommitTransactionId, plus OpenRazer razer_attr_write_poll_rate
-// for Viper Mini SE and DeathAdder V4 Pro), probe flag (Mouse Dock Pro: the paired mouse decides
+// persist: devices.js extendedPollingCommitTransactionId, plus OpenRazer razer_attr_write_poll_rate,
+// see below), probe flag (Mouse Dock Pro: the paired mouse decides
 // between the 1 kHz and 8 kHz ladders, discovered at read time), verified on hardware by OpenMouse.
 #include <cstdint>
 
@@ -36,19 +37,9 @@ struct RazerModel {
     bool verified;
 };
 
-// DeathAdder V4 Pro, as quoted from devices.js (no per-model delay or special case beyond this):
-//   [0x00be, { model: "DeathAdder V4 Pro (Wired)", ...MODERN_WIRED, pollingRates: RATES_8K,
-//              highRatePolling: true, maxDpi: DPI_DEATHADDER_V4_PRO }],          // 45000, tid 0x1f (TRANSACTION_1F)
-//   [0x00bf, { model: "DeathAdder V4 Pro", ...HYPERPOLLING_RECEIVER, maxDpi: DPI_DEATHADDER_V4_PRO }],
-//        // HYPERPOLLING_RECEIVER = MODERN_RECEIVER + RATES_8K + DPI_FOCUS_PRO_35K; MODERN_RECEIVER has
-//        // transport "new-receiver", wireless true, highRatePolling true, verified false
-//   [0x00ef, { model: "DeathAdder V4 Pro Carbon Fiber Edition (Wired)", ...MODERN_WIRED, pollingRates: RATES_8K,
-//              highRatePolling: true, maxDpi: DPI_DEATHADDER_V4_PRO }],
-//   [0x00f0, { model: "DeathAdder V4 Pro Carbon Fiber Edition", ...HYPERPOLLING_RECEIVER, maxDpi: DPI_DEATHADDER_V4_PRO }],
-// devices.js comment for the Carbon Fiber pair: "cosmetic SKU on its own product ids ... Not independently
-// hardware-tested; same specs assumed as the standard edition", and its transaction id 0x1f is "not
-// independently audited". None of the four is verified. Rates RATES_8K = 125 500 1000 2000 4000 8000.
-// OpenRazer razer_attr_write_poll_rate writes selector 0x00 then selector 0x01 on tid 0x1F for all four.
+// Commit transaction ids beyond devices.js, from OpenRazer razer_attr_write_poll_rate (second write
+// with selector 0x01 after the 0x00 write): 0x1F for 0x009E/0x009F, 0x00BE/0x00BF and 0x00EF/0x00F0;
+// 0xFF for Viper 8KHz 0x0091 and DeathAdder V3 Pro 0x00C3.
 inline const RazerModel kRazerModels[] = {
     { 0x0015, L"Naga", 0xFF, RzGroup::Standard, false, 8200, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
     { 0x001F, L"Naga Epic", 0xFF, RzGroup::Standard, false, 8200, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
@@ -112,7 +103,7 @@ inline const RazerModel kRazerModels[] = {
     { 0x008D, L"Naga Left-Handed Edition 2020", 0x1F, RzGroup::Standard, false, 20000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
     { 0x008F, L"Naga Pro (Wired)", 0x1F, RzGroup::NewReceiver, false, 20000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
     { 0x0090, L"Naga Pro", 0x1F, RzGroup::NewReceiver, true, 20000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
-    { 0x0091, L"Viper 8KHz", 0xFF, RzGroup::Standard, false, 20000, 0x01, { 125, 500, 1000, 2000, 4000, 8000 }, true, 0x00, false, false },
+    { 0x0091, L"Viper 8KHz", 0xFF, RzGroup::Standard, false, 20000, 0x01, { 125, 500, 1000, 2000, 4000, 8000 }, true, 0xFF, false, false },
     { 0x0094, L"Orochi V2", 0x1F, RzGroup::AtherisReceiver, true, 18000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
     { 0x0096, L"Naga X", 0x1F, RzGroup::Index3, false, 18000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
     { 0x0098, L"DeathAdder Essential (2021)", 0x3F, RzGroup::Standard, false, 6400, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
@@ -143,7 +134,7 @@ inline const RazerModel kRazerModels[] = {
     { 0x00C0, L"Viper V3 Pro", 0x1F, RzGroup::ViperReceiver, false, 35000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, true },
     { 0x00C1, L"Viper V3 Pro", 0x1F, RzGroup::ViperReceiver, true, 35000, 0x01, { 125, 500, 1000, 2000, 4000, 8000 }, true, 0x1F, false, true },
     { 0x00C2, L"DeathAdder V3 Pro (Wired)", 0x1F, RzGroup::NewReceiver, false, 30000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
-    { 0x00C3, L"DeathAdder V3 Pro", 0x1F, RzGroup::NewReceiver, true, 30000, 0x01, { 125, 500, 1000, 0, 0, 0 }, true, 0x00, false, false },
+    { 0x00C3, L"DeathAdder V3 Pro", 0x1F, RzGroup::NewReceiver, true, 30000, 0x01, { 125, 500, 1000, 0, 0, 0 }, true, 0xFF, false, false },
     { 0x00C4, L"DeathAdder V3 HyperSpeed (Wired)", 0x1F, RzGroup::NewReceiver, false, 30000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
     { 0x00C5, L"DeathAdder V3 HyperSpeed", 0x1F, RzGroup::NewReceiver, true, 30000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },
     { 0x00C7, L"Pro Click V2 Vertical Edition (Wired)", 0x1F, RzGroup::NewReceiver, false, 20000, 0x01, { 125, 500, 1000, 0, 0, 0 }, false, 0x00, false, false },

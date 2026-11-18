@@ -2,7 +2,8 @@
 // Logitech HID++ 2.0 helpers with no I/O: onboard profile (feature 0x8100) layout, CRC and the
 // DPI / report-rate fields, plus the decoders for the DPI (0x2201 / 0x2202) and report-rate
 // (0x8060 / 0x8061) replies. Kept free of Windows APIs so tests/logitech_onboard_test.cpp can
-// run them on the host.
+// run them on the host. `err` texts are English UI phrases: the caller passes them through T() and
+// fills the {hz} placeholder (the connection's rate ceiling) with TF().
 //
 // Ported from OpenMouse @openmouse/protocol 0.60.0 (AGPL-3.0-or-later):
 //   dist/drivers/logitech/onboard-profiles.js  formats, layouts, CRC, encodeDpiStages,

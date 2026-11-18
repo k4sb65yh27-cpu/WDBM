@@ -1,6 +1,6 @@
 // Optional bridge to HeadsetControl (github.com/Sapd/HeadsetControl), which supports many more
-// headsets than the built-in drivers. If headsetcontrol.exe sits next to WirelessBattery.exe or is
-// on PATH, it is run with `-o json` and any headset not already handled here is added.
+// headsets than the built-in drivers. If headsetcontrol.exe sits next to WirelessBattery.exe, it is
+// run with `-o json` and any headset not already handled here is added.
 #include "drivers.h"
 
 #include <cstdlib>
@@ -113,9 +113,8 @@ std::wstring FindExe() {
     std::wstring dir = self;
     dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
     std::wstring local = dir + L"headsetcontrol.exe";
+    // Only the copy next to the app: never PATH or the current directory.
     if (GetFileAttributesW(local.c_str()) != INVALID_FILE_ATTRIBUTES) return local;
-    wchar_t found[MAX_PATH];
-    if (SearchPathW(nullptr, L"headsetcontrol.exe", nullptr, MAX_PATH, found, nullptr)) return found;
     return L"";
 }
 

@@ -18,8 +18,8 @@
 //     report, which OpenMouse found three direct endpoints require.
 //   dist/drivers/logitech/onboard-profiles.js  see logitech_onboard.h.
 //   dist/drivers/logitech/mode-status.js       not used: nothing here touches 0x8090.
-// The HID++ framing, collections, receiver indexes and the C54F pass-through dongle are the ones
-// src/drivers/logitech.cpp uses for the battery.
+// The HID++ framing, collections and receiver indexes are the ones src/drivers/logitech.cpp uses for
+// the battery.
 //
 // What is written, and where (docs/settings-design.md goal 3: settings live on the mouse):
 //  * Mouse in onboard mode (0x8100 getMode = 1), the normal state without G HUB: the value goes
@@ -31,19 +31,22 @@
 //    at once; if the mouse refuses the live write it applies at the next power-on.
 //    Only profile formats OpenMouse marks writable (2, 3, 4, 7, 8) are written; any other
 //    format is refused with an error, never written live (a live-only write would silently revert).
+//    DPI is written only to the formats OpenMouse confirmed on hardware (3, 4, 7, 8): format 2 is
+//    trusted for its report-rate byte only (onboard-profiles.js), so a DPI change there is refused.
 //  * Host mode (G HUB holds the mouse): the live feature is the only setting in force; it is
 //    written and read back, and `err` says it is not stored on the mouse.
 //  * No 0x8100 feature (MX / productivity mice): the live feature write, as OpenMouse does.
 // The host/onboard mode itself is never changed (unlike OpenMouse's ensureHostControl).
 //
-// PRO X 2 / PRO X 3 SUPERSTRIKE (profile format 8, USB transport ids C0A8 / C0A9, the PRO X 3
-// Lightspeed dongle 046D:C54F on index 1, or the cable on 0xFF): the onboard path above. OpenMouse
-// confirms format 8's layout (CRC-matching dumps) and a DPI profile write on a PRO X 3; the cable
-// of a C0A9 runs 8 kHz, a C0A8 cable is capped at 1 kHz.
+// Transports (vendors.js, onboard-profiles.js): known receivers are probed on indexes 1..6 then
+// 0xFF (hidppDeviceIndexCandidates), the pass-through dongle 046D:C54F on index 1, a direct
+// endpoint on 0xFF then 1. A cable whose USB transport id is C0A9 runs the full wireless rate
+// range; any other cable is capped at the format's wired ceiling.
 //
 // Nothing here runs unless the menu asks: no timers, no background polling. Every exchange has a
-// timeout, and the time spent waiting on silent requests is capped per device (kBudgetMs), so a
-// sleeping mouse costs about a second.
+// timeout. While enumerating, the time spent waiting on silent requests is capped per device
+// (kBudgetMs), so a sleeping mouse costs about a second; a profile write gets its own, larger
+// budget (kWriteBudgetMs) so the read-back and the restore are never skipped.
 #include "../settings.h"
 
 #include <algorithm>
@@ -51,14 +54,18 @@
 #include <cwctype>
 #include <set>
 
+#include "../i18n.h"
 #include "logitech_onboard.h"
 
 namespace {
 
 constexpr USHORT kVid = 0x046D;
 constexpr BYTE kSwId = 0x0B;      // differs from the battery poller's 0x0D, so replies never cross
-constexpr int kBudgetMs = 1000;   // total wait on unanswered requests per device and operation
+constexpr int kBudgetMs = 1000;   // total wait on unanswered requests per device while enumerating
+constexpr int kWriteBudgetMs = 8000;  // the same for one profile write, and again for its restore
 constexpr int kReqMs = 500;
+constexpr int kChunkMs = 1000;    // memoryAddrWrite / memoryWrite
+constexpr int kCommitMs = 3000;   // memoryWriteEnd (the firmware checks the CRC and commits to flash)
 
 constexpr USHORT kFeatRoot = 0x0000, kFeatInfo = 0x0003, kFeatName = 0x0005;
 constexpr USHORT kFeatDpi = 0x2201, kFeatDpiExt = 0x2202, kFeatRate = 0x8060, kFeatRateExt = 0x8061;
@@ -68,7 +75,7 @@ constexpr USHORT kFeatOnboard = 0x8100;
 constexpr int kVarExtDpi = 1, kVarExtRate = 2, kVarWired = 4, kVarLongOnly = 8, kVarFullRateUsb = 16;
 constexpr int kVarFormatShift = 8;  // bits 8..15: onboard profile format id (0 = none / unknown)
 
-bool IsPassthroughDongle(USHORT pid) { return pid == 0xC54F; }  // PRO X3 SUPERSTRIKE dongle
+bool IsPassthroughDongle(USHORT pid) { return pid == 0xC54F; }  // pass-through Lightspeed dongle (vendors.js)
 bool IsBolt(USHORT pid) { return pid == 0xC548; }
 
 // Receivers (OpenMouse vendors.js LOGITECH_RECEIVER_PRODUCT_IDS without the C0A8 mouse interface
@@ -119,6 +126,10 @@ std::wstring PhysicalKey(const HidColl& c) {
 
 std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
+std::wstring ReadFailed() {
+    return TF(L"Couldn't read the mouse's settings. Try again. If it keeps failing, reconnect the receiver or cable.", {});
+}
+
 // ---- transport ---------------------------------------------------------------------------------
 
 enum class Res { Ok, Err20, Err10, Timeout };
@@ -132,8 +143,11 @@ public:
         return hasS_ || hasL_;
     }
     bool dead() const { return budget_ <= 0; }
+    void ResetBudget(int ms) { budget_ = ms; }
 
-    // Watches for the 0x8061 rate-change event [idx][feature][0x00][rate code] while requests run.
+    // Watches for the 0x8061 rate-change event [idx][feature][0x00][0x01][rate code] while requests
+    // run (hidpp.js matches report[0..3] = idx, feature, 0x00, 0x01 and reads report[4] without the
+    // report id; here r[0] is the report id, so the marker is r[4] and the code r[5]).
     void Watch(BYTE idx, BYTE feat) { watchIdx_ = idx; watchFeat_ = feat; event_ = -1; }
     int event() const { return event_; }
 
@@ -160,7 +174,8 @@ public:
             for (HidDev* d : { &l_, &s_ }) {
                 if (!d->ok() || d->Read(r, 15) < 7) continue;
                 if ((r[0] != 0x10 && r[0] != 0x11) || r[1] != idx) continue;
-                if (watchFeat_ && r[1] == watchIdx_ && r[2] == watchFeat_ && r[3] == 0x00) event_ = r[4];
+                if (watchFeat_ && r.size() >= 6 && r[1] == watchIdx_ && r[2] == watchFeat_ && r[3] == 0x00 && r[4] == 0x01)
+                    event_ = r[5];
                 if (r[2] == feat && r[3] == b3) {
                     p.assign(r.begin() + 4, r.end());
                     return Res::Ok;
@@ -187,7 +202,9 @@ public:
         while (event_ != wanted && (LONGLONG)end - (LONGLONG)GetTickCount64() > 0) {
             for (HidDev* d : { &l_, &s_ }) {
                 if (!d->ok() || d->Read(r, 15) < 7) continue;
-                if ((r[0] == 0x10 || r[0] == 0x11) && r[1] == idx && r[2] == watchFeat_ && r[3] == 0x00) event_ = r[4];
+                if ((r[0] == 0x10 || r[0] == 0x11) && r.size() >= 6 && r[1] == idx && r[2] == watchFeat_ && r[3] == 0x00 &&
+                    r[4] == 0x01)
+                    event_ = r[5];
             }
         }
     }
@@ -384,14 +401,14 @@ bool ReadSector(Mouse& m, int sector, int len, std::vector<BYTE>& out) {
 bool WriteSector(Mouse& m, int sector, const std::vector<BYTE>& bytes) {
     std::vector<BYTE> p;
     int n = (int)bytes.size();
-    if (!m.h->Call(m.idx, m.fOnb, 6, { (BYTE)(sector >> 8), (BYTE)sector, 0, 0, (BYTE)(n >> 8), (BYTE)n }, p))
+    if (!m.h->Call(m.idx, m.fOnb, 6, { (BYTE)(sector >> 8), (BYTE)sector, 0, 0, (BYTE)(n >> 8), (BYTE)n }, p, kChunkMs))
         return false;
     for (int off = 0; off < n; off += 16) {
         std::vector<BYTE> chunk(16, 0xFF);
         for (int i = 0; i < 16 && off + i < n; ++i) chunk[i] = bytes[off + i];
-        if (!m.h->Call(m.idx, m.fOnb, 7, chunk, p)) return false;
+        if (!m.h->Call(m.idx, m.fOnb, 7, chunk, p, kChunkMs)) return false;
     }
-    return m.h->Call(m.idx, m.fOnb, 8, {}, p, 1500);
+    return m.h->Call(m.idx, m.fOnb, 8, {}, p, kCommitMs);
 }
 
 // ---- enumeration ---------------------------------------------------------------------------------
@@ -412,11 +429,13 @@ void ProbeGroup(USHORT pid, const Group& g, std::set<std::string>& units, std::v
     std::vector<BYTE> indices;
     if (IsPassthroughDongle(pid)) indices = { 1 };
     else if (bluetooth) indices = { 0xFF };
-    else if (receiver) indices = { 1, 2, 3, 4, 5, 6 };
-    else indices = { 0xFF, 1 };  // hidppDeviceIndexCandidates for a non-receiver
+    else if (receiver) indices = { 1, 2, 3, 4, 5, 6, 0xFF };  // hidppDeviceIndexCandidates
+    else indices = { 0xFF, 1 };
 
+    bool found = false;
     for (BYTE idx : indices) {
         if (h.dead()) break;
+        if (receiver && idx == 0xFF && found) break;  // 0xFF is a last resort when no slot answered
         if (!h.Ping20(idx, 400)) continue;
         Mouse m;
         m.h = &h;
@@ -434,6 +453,7 @@ void ProbeGroup(USHORT pid, const Group& g, std::set<std::string>& units, std::v
         d.featDpi = m.fDpi;
         d.featRate = m.fRate;
         d.featOnboard = m.fOnb;
+        d.unitId = m.unitId;
         d.name = ReadName(m);
         if (d.name.empty()) d.name = (idx == 0xFF && !product.empty()) ? product : L"Logitech mouse";
 
@@ -460,13 +480,11 @@ void ProbeGroup(USHORT pid, const Group& g, std::set<std::string>& units, std::v
             rates.erase(std::remove_if(rates.begin(), rates.end(), [ceiling](int r) { return r > ceiling; }), rates.end());
         }
         d.caps.pollingRates = rates;
-        d.pollingHz = ReadRate(m);
-        if (rc.ok && d.pollingHz > 0) {
-            int ceiling = m.wired ? rc.wiredMaxHz : rc.wirelessMaxHz;
-            d.pollingHz = std::min(d.pollingHz, ceiling);
-        }
-        d.verified = haveOnb && logi::FormatHardwareConfirmed(format);
+        d.pollingHz = ReadRate(m);  // shown as read, even above the ceiling the menu offers
+        // Format 8 is confirmed for a DPI profile write only (onboard-profiles.js), not the rate.
+        d.verified = haveOnb && logi::FormatHardwareConfirmed(format) && format != 8;
         out.push_back(d);
+        found = true;
         if (idx == 0xFF) break;  // a direct endpoint is one mouse
     }
 }
@@ -487,7 +505,7 @@ bool OpenSession(const SettingsDevice& d, Session& s, std::wstring& err) {
     for (const HidColl& c : colls)
         if (c.path == d.path) key = PhysicalKey(c);
     if (key.empty()) {
-        err = L"The mouse is no longer connected.";
+        err = TF(L"The mouse is no longer connected.", {});
         return false;
     }
     const HidColl *sc = nullptr, *lc = nullptr;
@@ -497,68 +515,78 @@ bool OpenSession(const SettingsDevice& d, Session& s, std::wstring& err) {
         if (!lc && IsLongColl(c)) lc = &c;
     }
     if (!s.h.Open(sc, lc, (d.variant & kVarLongOnly) != 0)) {
-        err = L"Could not open the mouse's control interface.";
+        err = ReadFailed();
         return false;
     }
     s.m.h = &s.h;
     s.m.idx = (BYTE)d.hidppIndex;
     if (!s.h.Ping20(s.m.idx, 400)) {
-        err = L"The mouse did not answer. Move it or click a button, then try again.";
+        err = TF(L"The mouse didn't respond. Move it or click a button, then try again.", {});
         return false;
     }
     ResolveFeatures(s.m);
+    if (!d.unitId.empty()) {  // after re-pairing, the slot may hold another mouse
+        ReadIdentity(s.m, d.pid, IsBluetoothPath(d.path));
+        if (s.m.unitId != d.unitId) {
+            err = TF(L"Another mouse is now connected in its place. Open the menu again.", {});
+            return false;
+        }
+    }
     s.m.wired = (d.variant & kVarWired) != 0;
     s.m.usbTid = (d.variant & kVarFullRateUsb) ? 0xC0A9 : 0;
     if (s.m.fOnb) {
         s.haveOnb = ReadOnboard(s.m, s.o);
         if (!s.haveOnb) {
-            err = L"Could not read the mouse's onboard memory state.";
+            err = ReadFailed();
             return false;
         }
     }
     return true;
 }
 
+std::wstring UnsupportedOnboard() {
+    return TF(L"This mouse's onboard memory isn't supported yet, so nothing was changed. Change this setting in G HUB.", {});
+}
+
 // openActiveProfile + the write/verify/restore part of writeActiveProfile, with `patch` changing
-// only the requested field. Returns false with `err` set; the sector is left as it was.
+// only the requested field (its `err` is already translated). Returns false with `err` set.
 template <class Patch>
 bool WriteActiveProfile(Session& s, Patch patch, std::wstring& err) {
     Mouse& m = s.m;
     if (!logi::FormatWritable(s.o.format)) {
-        err = L"This mouse runs from its onboard memory (profile format " + std::to_wstring(s.o.format) +
-              L"), which cannot be written safely yet. Change it in G HUB.";
+        err = UnsupportedOnboard();
         return false;
     }
+    m.h->ResetBudget(kWriteBudgetMs);
     std::vector<BYTE> p;
     if (!m.h->Call(m.idx, m.fOnb, 4, {}, p) || p.size() < 2) {
-        err = L"Could not read the active onboard profile.";
+        err = ReadFailed();
         return false;
     }
     int sector = (p[0] << 8) | p[1];
     if (sector < 1 || sector > 0xFF) {  // 0 is the directory; 0x01xx are read-only factory (ROM) profiles
-        err = L"The mouse runs a read-only factory profile. Enable a writable profile in G HUB first.";
+        err = TF(L"The mouse is using a built-in profile that can't be changed. In G HUB, switch to an editable onboard profile, then try again.", {});
         return false;
     }
     std::vector<BYTE> before;
     if (!ReadSector(m, sector, s.o.sectorSize, before)) {
-        err = L"Could not read the onboard profile.";
+        err = ReadFailed();
         return false;
     }
     if (logi::ProfileCrc(before) != logi::StoredCrc(before)) {
-        err = L"The onboard profile failed its checksum; nothing was written.";
+        err = TF(L"The mouse's onboard profile looks damaged, so nothing was changed. Check it in G HUB.", {});
         return false;
     }
     std::vector<BYTE> after = before;
-    std::string why;
-    if (!patch(after, why)) {
-        err = Widen(why);
-        return false;
-    }
+    if (!patch(after, err)) return false;
     if (after == before) return true;  // never spend a flash cycle on a no-op
     std::vector<BYTE> check;
     if (WriteSector(m, sector, after) && ReadSector(m, sector, s.o.sectorSize, check) && check == after) return true;
-    WriteSector(m, sector, before);  // best effort restore
-    err = L"The mouse did not store the onboard profile as written; the previous profile was restored.";
+    m.h->ResetBudget(kWriteBudgetMs);  // the restore never runs on what the write left of the budget
+    if (WriteSector(m, sector, before) && ReadSector(m, sector, s.o.sectorSize, check) && check == before)
+        err = TF(L"The mouse didn't save the change correctly. Its previous settings were restored.", {});
+    else
+        err = TF(L"The mouse didn't save the change correctly, and its previous settings couldn't be restored. Reconnect the mouse, then check its settings in G HUB.", {});
     return false;
 }
 
@@ -604,8 +632,21 @@ bool LiveSetRate(Mouse& m, int hz) {
     return ReadRate(m) == hz;
 }
 
-const wchar_t* kHostNote = L"The mouse is in host mode (G HUB): the new value is not stored on the mouse.";
-const wchar_t* kLaterNote = L"Saved in the mouse's onboard memory; it applies the next time the mouse powers on.";
+// Host mode note, shown once per mouse per session (this runs on the settings worker thread only).
+std::wstring HostNote(const SettingsDevice& d) {
+    static std::set<std::wstring> shown;
+    if (!shown.insert(d.path).second) return L"";
+    return TF(L"G HUB is controlling this mouse, so this value resets when the mouse turns off. To keep it, turn on onboard memory in G HUB.", {});
+}
+
+std::wstring LaterNote() { return TF(L"Saved to the mouse. It takes effect the next time you turn the mouse on.", {}); }
+
+std::wstring UnknownMode() { return TF(L"The mouse is in a mode this app doesn't recognize, so nothing was changed.", {}); }
+
+std::wstring Stayed(const std::wstring& now, const std::wstring& value) {
+    return TF(L"The mouse stayed at {now} instead of {value}. It may not support that value.",
+              { { L"now", now }, { L"value", value } });
+}
 
 }  // namespace
 
@@ -636,19 +677,19 @@ void EnumLogitechSettings(const std::vector<HidColl>& colls, std::vector<Setting
 
 bool LogitechSetDpi(SettingsDevice& d, int dpi, std::wstring& err) {
     if (d.caps.dpiMax <= 0 || dpi < d.caps.dpiMin || dpi > d.caps.dpiMax) {
-        err = L"DPI out of range.";
+        err = TF(L"This value is outside the range of this mouse.", {});
         return false;
     }
     Session s;
     if (!OpenSession(d, s, err)) return false;
     Mouse& m = s.m;
     if (!m.fDpi) {
-        err = L"This mouse does not expose DPI controls.";
+        err = TF(L"This mouse doesn't let you change its DPI.", {});
         return false;
     }
     std::vector<logi::DpiRun> runs;
     if (!ReadDpiRuns(m, runs)) {
-        err = L"Could not read the DPI values the mouse supports.";
+        err = ReadFailed();
         return false;
     }
     if (runs.empty() && !m.extDpi) {
@@ -657,60 +698,70 @@ bool LogitechSetDpi(SettingsDevice& d, int dpi, std::wstring& err) {
     }
     if (!logi::DpiListed(runs, dpi)) {
         int closest = logi::NearestListedDpi(runs, dpi);
-        err = std::to_wstring(dpi) + L" DPI is not offered by this mouse" +
-              (closest ? L" (nearest: " + std::to_wstring(closest) + L")." : L".");
+        err = closest ? TF(L"This mouse doesn't offer {dpi} DPI. Nearest value: {nearest} DPI.",
+                           { { L"dpi", std::to_wstring(dpi) }, { L"nearest", std::to_wstring(closest) } })
+                      : TF(L"This mouse doesn't offer {dpi} DPI.", { { L"dpi", std::to_wstring(dpi) } });
         return false;
     }
 
     if (s.haveOnb && s.o.mode == 1) {
         const int format = s.o.format;
-        auto patch = [format, dpi](std::vector<BYTE>& sector, std::string& why) {
+        if (!logi::FormatHardwareConfirmed(format)) {  // format 2: rate byte only (see the header)
+            err = UnsupportedOnboard();
+            return false;
+        }
+        auto patch = [format, dpi](std::vector<BYTE>& sector, std::wstring& e) {
+            const char* layout = "The mouse's onboard profile has an unexpected layout, so nothing was changed.";
             logi::DpiTable t;
             if (!logi::DecodeDpiTable(sector, format, t)) {
-                why = "The onboard profile has no DPI table.";
+                e = T(Widen(layout));
                 return false;
             }
             int slot = t.defaultIndex;  // the slot the mouse loads at power-on
             if (slot < 0 || slot >= (int)t.slots.size() || !t.slots[slot].x) {
-                why = "The onboard profile has no default DPI slot.";
+                e = T(Widen(layout));
                 return false;
             }
-            return logi::EncodeSlotDpi(sector, format, slot, dpi, why);
+            std::string why;
+            if (logi::EncodeSlotDpi(sector, format, slot, dpi, why)) return true;
+            e = T(Widen(why));
+            return false;
         };
         if (!WriteActiveProfile(s, patch, err)) return false;
         d.dpi = dpi;
-        if (!LiveSetDpi(m, dpi)) err = kLaterNote;
+        if (!LiveSetDpi(m, dpi)) err = LaterNote();
         return true;
     }
     if (s.haveOnb && s.o.mode != 2) {
-        err = L"The mouse reported an unknown onboard memory mode; nothing was written.";
+        err = UnknownMode();
         return false;
     }
     if (!LiveSetDpi(m, dpi)) {
         DpiNow now;
-        err = ReadDpi(m, now) ? L"The mouse kept " + std::to_wstring(now.x) + L" DPI." : L"The mouse rejected the DPI change.";
+        err = ReadDpi(m, now) ? Stayed(std::to_wstring(now.x) + L" DPI", std::to_wstring(dpi) + L" DPI")
+                              : TF(L"The mouse refused this setting. Its firmware may not support it.", {});
         return false;
     }
     d.dpi = dpi;
-    if (s.haveOnb) err = kHostNote;
+    if (s.haveOnb) err = HostNote(d);
     return true;
 }
 
 bool LogitechSetPolling(SettingsDevice& d, int hz, std::wstring& err) {
     if (std::find(d.caps.pollingRates.begin(), d.caps.pollingRates.end(), hz) == d.caps.pollingRates.end()) {
-        err = L"Polling rate not supported.";
+        err = TF(L"This mouse doesn't support this polling rate.", {});
         return false;
     }
     Session s;
     if (!OpenSession(d, s, err)) return false;
     Mouse& m = s.m;
     if (!m.fRate) {
-        err = L"This mouse does not expose report-rate controls.";
+        err = TF(L"This mouse doesn't let you change its polling rate.", {});
         return false;
     }
     std::vector<int> live = ReadRates(m);
     if (std::find(live.begin(), live.end(), hz) == live.end()) {
-        err = L"The mouse does not offer " + std::to_wstring(hz) + L" Hz on this connection.";
+        err = TF(L"This mouse doesn't offer {hz} Hz on this connection.", { { L"hz", std::to_wstring(hz) } });
         return false;
     }
 
@@ -718,24 +769,29 @@ bool LogitechSetPolling(SettingsDevice& d, int hz, std::wstring& err) {
         const int format = s.o.format;
         const bool wired = m.wired;
         const logi::FormatCaps caps = logi::CapsForDevice(format, m.usbTid);
-        auto patch = [format, wired, hz, caps](std::vector<BYTE>& sector, std::string& why) {
-            return logi::EncodeProfileRate(sector, format, wired, hz, caps, why);
+        auto patch = [format, wired, hz, caps](std::vector<BYTE>& sector, std::wstring& e) {
+            std::string why;
+            if (logi::EncodeProfileRate(sector, format, wired, hz, caps, why)) return true;
+            int ceiling = wired ? caps.wiredMaxHz : caps.wirelessMaxHz;
+            e = TF(Widen(why).c_str(), { { L"hz", std::to_wstring(ceiling) } });
+            return false;
         };
         if (!WriteActiveProfile(s, patch, err)) return false;
         d.pollingHz = hz;
-        if (!LiveSetRate(m, hz)) err = kLaterNote;
+        if (!LiveSetRate(m, hz)) err = LaterNote();
         return true;
     }
     if (s.haveOnb && s.o.mode != 2) {
-        err = L"The mouse reported an unknown onboard memory mode; nothing was written.";
+        err = UnknownMode();
         return false;
     }
     if (!LiveSetRate(m, hz)) {
         int now = ReadRate(m);
-        err = now > 0 ? L"The mouse kept " + std::to_wstring(now) + L" Hz." : L"The mouse rejected the polling rate change.";
+        err = now > 0 ? Stayed(std::to_wstring(now) + L" Hz", std::to_wstring(hz) + L" Hz")
+                      : TF(L"The mouse refused this setting. Its firmware may not support it.", {});
         return false;
     }
     d.pollingHz = hz;
-    if (s.haveOnb) err = kHostNote;
+    if (s.haveOnb) err = HostNote(d);
     return true;
 }

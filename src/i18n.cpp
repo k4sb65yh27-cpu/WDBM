@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 
 namespace {
@@ -23,6 +24,7 @@ struct Source {
 
 std::map<std::wstring, Source> g_sources;           // by lower-case code
 std::unordered_map<std::wstring, std::wstring> g_phrases;  // English -> translation, for the active language
+std::mutex g_phrasesLock;  // held while g_phrases changes (UI thread) and by the copying lookups (any thread)
 std::wstring g_choice;                               // saved choice, "" = automatic
 bool g_rtl = false;
 std::string g_template;                              // lang/_template.txt, every English phrase
@@ -175,6 +177,7 @@ std::wstring AutoCode() {
 }
 
 void Apply() {
+    std::lock_guard<std::mutex> lock(g_phrasesLock);
     g_phrases.clear();
     g_rtl = false;
     std::wstring code = g_choice.empty() ? AutoCode() : Lower(g_choice);
@@ -241,10 +244,13 @@ const wchar_t* T(const wchar_t* en) {
     return it == g_phrases.end() ? en : it->second.c_str();
 }
 
-std::wstring T(const std::wstring& en) { return T(en.c_str()); }
+std::wstring T(const std::wstring& en) {
+    std::lock_guard<std::mutex> lock(g_phrasesLock);
+    return T(en.c_str());
+}
 
 std::wstring TF(const wchar_t* en, std::initializer_list<std::pair<const wchar_t*, std::wstring>> args) {
-    std::wstring s = T(en);
+    std::wstring s = T(std::wstring(en));
     for (const auto& [name, value] : args) {
         std::wstring tag = L"{" + std::wstring(name) + L"}";
         for (size_t at = s.find(tag); at != std::wstring::npos; at = s.find(tag, at + value.size())) s.replace(at, tag.size(), value);

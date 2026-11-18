@@ -1,7 +1,9 @@
 #pragma once
 // Native mouse settings (DPI, polling rate). See docs/settings-design.md.
 // Read once when a device arrives or on request, written only when the user picks a value:
-// nothing here runs while the app is idle.
+// nothing here runs while the app is idle. Drivers run on the settings worker thread: their `err`
+// texts use TF() / the std::wstring T() (the const wchar_t* T() is for the UI thread only).
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -24,7 +26,14 @@ struct SettingsDevice {
     int dpi = -1;             // current active DPI, -1 unknown
     int pollingHz = -1;       // current rate, -1 unknown
     bool verified = false;    // model confirmed on hardware by the source project
+    std::string unitId;       // Logitech unit id (memory only): a write checks the slot still holds this mouse
 };
+
+// One lock per vendor, held by the battery poller (PollRazer / PollLogitech) and by the settings
+// enumeration and writes, so the two threads never talk to the same vendor's devices at once.
+// Each holder takes one lock at a time, never both, so they cannot deadlock.
+std::mutex& RazerIoLock();
+std::mutex& LogitechIoLock();
 
 std::vector<SettingsDevice> EnumSettingsDevices();                // blocking, worker thread only
 bool ApplyDpi(SettingsDevice& d, int dpi, std::wstring& err);      // updates d.dpi on success

@@ -9,6 +9,7 @@
 #include "drivers/drivers.h"
 #include "report.h"
 #include "hid.h"
+#include "settings.h"
 
 namespace {
 
@@ -92,8 +93,14 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollHyperX(ctx);
     PollLogitechG435(ctx);  // before the HID++ driver, which shares the vendor id
     PollAstro(ctx);
-    PollLogitech(ctx);
-    PollRazer(ctx);
+    {
+        std::lock_guard<std::mutex> lock(LogitechIoLock());  // not while the settings worker talks to them
+        PollLogitech(ctx);
+    }
+    {
+        std::lock_guard<std::mutex> lock(RazerIoLock());
+        PollRazer(ctx);
+    }
     PollSteelSeriesElite(ctx);
     PollSteelSeries(ctx);
     PollAudeze(ctx);

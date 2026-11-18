@@ -120,22 +120,22 @@ bool DecodeDpiTable(const std::vector<uint8_t>& s, int format, DpiTable& out) {
 bool EncodeSlotDpi(std::vector<uint8_t>& s, int format, int slot, int dpi, std::string& err) {
     DpiTable t;
     if (!DecodeDpiTable(s, format, t)) {
-        err = "The onboard profile is too short.";
+        err = "The mouse's onboard profile has an unexpected layout, so nothing was changed.";
         return false;
     }
     if (slot < 0 || slot >= kSlots || t.slots[slot].x == 0) {
-        err = "The onboard profile has no DPI in that slot.";
+        err = "The mouse's onboard profile has an unexpected layout, so nothing was changed.";
         return false;
     }
     if (dpi <= 0 || dpi > 0xFFFE) {
-        err = "DPI value out of range.";
+        err = "This value is outside the range of this mouse.";
         return false;
     }
     Layout l = LayoutForFormat(format);
     if (l.v6) {
         // validateDpiStagePlan: a used v6 stage carries a lift-off level 1..3 (0 = unused).
         if (t.slots[slot].lod < 1 || t.slots[slot].lod > 3) {
-            err = "The onboard profile has an unexpected DPI slot.";
+            err = "The mouse's onboard profile has an unexpected layout, so nothing was changed.";
             return false;
         }
         size_t base = (size_t)l.dpi + 2 + slot * 5;
@@ -169,25 +169,25 @@ bool EncodeProfileRate(std::vector<uint8_t>& s, int format, bool wired, int hz, 
                        std::string& err) {
     int ceiling = wired ? caps.wiredMaxHz : caps.wirelessMaxHz;
     if (!caps.ok || ceiling <= 0) {
-        err = "Report rates are not known for this profile format.";
+        err = "This mouse's onboard memory isn't supported yet, so nothing was changed. Change this setting in G HUB.";
         return false;
     }
     int code = RateCode(hz);
     if (code < 0 || hz > ceiling) {
-        err = "This connection stores report rates up to " + std::to_string(ceiling) + " Hz.";
+        err = "This connection stores polling rates up to {hz} Hz.";
         return false;
     }
     Layout l = LayoutForFormat(format);
     size_t off = (size_t)(wired ? l.rateWired : l.rateWireless);
     if (off + 2 >= s.size()) {
-        err = "The onboard profile is too short.";
+        err = "The mouse's onboard profile has an unexpected layout, so nothing was changed.";
         return false;
     }
     if (l.v6) {
         s[off] = (uint8_t)code;
     } else {
         if (1000 % hz) {
-            err = "This profile format stores whole-millisecond intervals only.";
+            err = "This polling rate can't be saved in the mouse's onboard memory.";
             return false;
         }
         s[off] = (uint8_t)(1000 / hz);

@@ -17,6 +17,8 @@
 
 #include <cstring>
 
+#include "../i18n.h"
+
 #include "razer_models.h"
 
 namespace {
@@ -44,9 +46,14 @@ int GroupDelay(RzGroup g) {
     }
 }
 
-// One request/reply exchange on the 90-byte feature report. `sends` bounds how often the request is
+// One request/reply exchange on the 90-byte feature report. `sends` bounds how often a getter is
 // sent again when the reply was lost (Synapse shares the mailbox) or the receiver timed out; "busy"
-// only keeps reading. Worst case is a bit over a second, so a sleeping mouse never blocks for long.
+// only keeps reading. A setter (id bit 7 clear) is not re-sent on a foreign reply, as in
+// drivers/razer/hid.js: it returns NoReply and the caller's read-back decides.
+// The read loops are bounded (sends x 6 x delay: about 0.5 s per send on most models, 1.1 s on the
+// Atheris receiver), but HidD_SetFeature / HidD_GetFeature are synchronous with no timeout of their
+// own: a wedged control endpoint blocks each call for the USB stack's control-transfer timeout
+// (seconds). A sleeping wireless mouse is not affected: the receiver answers "timeout" at once.
 Rz Exchange(HidDev& d, int delayMs, BYTE tid, BYTE cls, BYTE id, BYTE size, const std::vector<BYTE>& in,
             std::vector<BYTE>& out, int sends) {
     std::vector<BYTE> rep(91, 0);  // [0] = report id 0, then the 90-byte report
@@ -61,6 +68,7 @@ Rz Exchange(HidDev& d, int delayMs, BYTE tid, BYTE cls, BYTE id, BYTE size, cons
     r[88] = crc;
     std::vector<BYTE> resp;
     Rz res = Rz::NoReply;
+    const bool setter = (id & 0x80) == 0;
     for (int s = 0; s < sends; s++) {
         if (!d.SetFeature(rep)) return Rz::NoReply;
         for (int rd = 0; rd < 6; rd++) {
@@ -69,8 +77,11 @@ Rz Exchange(HidDev& d, int delayMs, BYTE tid, BYTE cls, BYTE id, BYTE size, cons
             const BYTE* a = resp.data() + 1;
             BYTE replyCrc = 0;
             for (int i = 2; i < 88; i++) replyCrc ^= a[i];
-            if (a[1] != tid || a[2] || a[3] || a[4] || a[6] != cls || a[7] != id || a[88] != replyCrc)
-                break;  // somebody else's reply: ask again
+            if (a[1] != tid || a[2] || a[3] || a[4] || a[5] != size || a[6] != cls || a[7] != id ||
+                a[88] != replyCrc) {
+                if (setter) return Rz::NoReply;  // never send a write twice
+                break;                           // somebody else's reply: ask again
+            }
             if (a[0] == 0x01) continue;  // busy: the same request is still being processed
             if (a[0] == 0x02) { out.assign(a + 8, a + 88); return Rz::Ok; }
             if (a[0] == 0x04) { res = Rz::Offline; break; }
@@ -99,6 +110,9 @@ struct Link {
     }
     // Reads the polling rate with the command the model uses, then the other one (a wired model may
     // answer only the legacy command, a receiver only the extended one: see readPollingRateHz()).
+    // Only a probeRates model switches its write encoding to the command that answered
+    // (drivers/razer/hid.js discovers it for probePollingRates models only); for any other model the
+    // fallback is used for display and writes keep the model's encoding.
     Rz ReadPolling(int& hz, int sends) {
         std::vector<BYTE> a;
         Rz first = Rz::NoReply;
@@ -110,7 +124,7 @@ struct Link {
                 int div = e ? a[1] : a[0];
                 if (!div) continue;
                 hz = (e ? 8000 : 1000) / div;
-                ext = e;
+                if (m->probeRates) ext = e;
                 return Rz::Ok;
             }
             if (r == Rz::Offline) return r;  // asleep: do not wait for the second command too
@@ -134,12 +148,25 @@ bool OpenLink(Link& l, const SettingsDevice& d) {
     return l.dev.OpenFeatureOnly(c);
 }
 
-const wchar_t* Why(Rz r) {
+std::wstring Why(Rz r) {
     switch (r) {
-        case Rz::Offline: return L"The mouse is asleep or switched off.";
-        case Rz::Unsupported: return L"The mouse rejected the command.";
-        default: return L"The mouse did not answer (is Razer Synapse running?).";
+        case Rz::Offline: return TF(L"The mouse is asleep or turned off. Move it to wake it up, then try again.", {});
+        case Rz::Unsupported: return TF(L"The mouse refused this setting. Its firmware may not support it.", {});
+        default: return TF(L"The mouse didn't respond. If Razer Synapse is running, close it and try again.", {});
     }
+}
+
+std::wstring OpenFailed() {
+    return TF(L"Couldn't open the mouse. Another app, such as Razer Synapse, may be using it. Close that app and try again.", {});
+}
+
+std::wstring NotConfirmed() {
+    return TF(L"The new value was sent, but the mouse didn't confirm it. Open the menu again to see the current value.", {});
+}
+
+std::wstring Stayed(const std::wstring& now, const std::wstring& value) {
+    return TF(L"The mouse stayed at {now} instead of {value}. It may not support that value.",
+              { { L"now", now }, { L"value", value } });
 }
 
 std::wstring BaseName(std::wstring n) {
@@ -218,22 +245,23 @@ void EnumRazerSettings(const std::vector<HidColl>& colls, std::vector<SettingsDe
 bool RazerSetDpi(SettingsDevice& d, int dpi, std::wstring& err) {
     if (d.caps.dpiMax <= 0 || dpi < d.caps.dpiMin || dpi > d.caps.dpiMax ||
         (d.caps.dpiStep > 0 && (dpi - d.caps.dpiMin) % d.caps.dpiStep != 0)) {
-        err = L"This DPI value is outside the range of the mouse.";
+        err = TF(L"This value is outside the range of this mouse.", {});
         return false;
     }
     Link l;
-    if (!OpenLink(l, d)) { err = L"Cannot open the mouse (not a known Razer model, or in use).";  return false; }
-    // Persistent store (RAZER_STORAGE = 0x01) so the value survives a power cycle.
-    std::vector<BYTE> args = { l.m->dpiStore, (BYTE)(dpi >> 8), (BYTE)dpi, (BYTE)(dpi >> 8), (BYTE)dpi, 0, 0 };
+    if (!OpenLink(l, d)) { err = OpenFailed(); return false; }
+    // Always the persistent store (RAZER_STORAGE = 0x01) so the value survives a power cycle: OpenRazer's
+    // razer_chroma_misc_set_dpi_xy writes VARSTORE on every model; dpiStore only selects the read.
+    std::vector<BYTE> args = { 0x01, (BYTE)(dpi >> 8), (BYTE)dpi, (BYTE)(dpi >> 8), (BYTE)dpi, 0, 0 };
     std::vector<BYTE> reply;
     Rz r = l.Cmd(0x04, 0x05, 0x07, args, reply, 2);
-    if (r != Rz::Ok) { err = Why(r); return false; }
+    if (r != Rz::Ok && r != Rz::NoReply) { err = Why(r); return false; }  // NoReply: the read-back decides
     int now = -1;
-    r = l.ReadDpi(now, 3);
-    if (r != Rz::Ok) { err = L"DPI was sent but could not be confirmed."; return false; }
+    Rz rb = l.ReadDpi(now, 3);
+    if (rb != Rz::Ok) { err = r == Rz::Ok ? NotConfirmed() : Why(r); return false; }
     d.dpi = now;
     if (now != dpi) {
-        err = L"The mouse kept " + std::to_wstring(now) + L" DPI instead of " + std::to_wstring(dpi) + L".";
+        err = Stayed(std::to_wstring(now) + L" DPI", std::to_wstring(dpi) + L" DPI");
         return false;
     }
     return true;
@@ -242,29 +270,31 @@ bool RazerSetDpi(SettingsDevice& d, int dpi, std::wstring& err) {
 bool RazerSetPolling(SettingsDevice& d, int hz, std::wstring& err) {
     bool allowed = false;
     for (int r : d.caps.pollingRates) allowed |= r == hz;
-    if (!allowed) { err = L"This polling rate is not supported by the mouse."; return false; }
+    if (!allowed) { err = TF(L"This mouse doesn't support this polling rate.", {}); return false; }
     Link l;
-    if (!OpenLink(l, d)) { err = L"Cannot open the mouse (not a known Razer model, or in use).";  return false; }
+    if (!OpenLink(l, d)) { err = OpenFailed(); return false; }
     int ceiling = l.ext ? 8000 : 1000;
-    if (hz <= 0 || ceiling % hz != 0) { err = L"This polling rate cannot be encoded."; return false; }
+    if (hz <= 0 || ceiling % hz != 0) { err = TF(L"This mouse doesn't support this polling rate.", {}); return false; }
     BYTE div = (BYTE)(ceiling / hz);
     std::vector<BYTE> reply;
     Rz r = l.ext ? l.Cmd(0x00, 0x40, 0x02, { 0x00, div }, reply, 2)  // selector 0x00: live rate
                  : l.Cmd(0x00, 0x05, 0x01, { div }, reply, 2);
-    if (r != Rz::Ok) { err = Why(r); return false; }
-    if (l.ext && l.m->commitTid) {
+    if (r != Rz::Ok && r != Rz::NoReply) { err = Why(r); return false; }  // NoReply: the read-back decides
+    bool stored = true;
+    if (r == Rz::Ok && l.ext && l.m->commitTid) {
         // Selector 0x01 stores the rate (devices.js extendedPollingCommitTransactionId; OpenRazer).
-        Exchange(l.dev, l.delayMs, l.m->commitTid, 0x00, 0x40, 0x02, { 0x01, div }, reply, 2);
+        stored = Exchange(l.dev, l.delayMs, l.m->commitTid, 0x00, 0x40, 0x02, { 0x01, div }, reply, 2) == Rz::Ok;
     }
     // The wireless link reconfigures for a moment (POLLING_LINK_SETTLE_MS in drivers/razer/hid.js).
     if (l.m->wireless) Sleep(150);
     int now = -1;
-    r = l.ReadPolling(now, 3);
-    if (r != Rz::Ok) { err = L"Polling rate was sent but could not be confirmed."; return false; }
+    Rz rb = l.ReadPolling(now, 3);
+    if (rb != Rz::Ok) { err = r == Rz::Ok ? NotConfirmed() : Why(r); return false; }
     d.pollingHz = now;
     if (now != hz) {
-        err = L"The mouse kept " + std::to_wstring(now) + L" Hz instead of " + std::to_wstring(hz) + L" Hz.";
+        err = Stayed(std::to_wstring(now) + L" Hz", std::to_wstring(hz) + L" Hz");
         return false;
     }
+    if (!stored) err = TF(L"Applied now, but the mouse didn't confirm that it saved this value.", {});
     return true;
 }

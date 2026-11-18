@@ -50,8 +50,12 @@ bool LogitechSetPolling(SettingsDevice&, int hz, std::wstring& err);
 
 Rules for drivers:
 - Only the HID layer in `src/hid.h` (`HidDev`, `EnumHid`). No new dependency.
-- A write is attempted only for a model in the driver's table; unknown products are never written to.
-- Read back after each write; report a failure in `err` (short English sentence, shown in a balloon).
+- Razer: a write is attempted only for a model in the driver's table; unknown products are never opened.
+- Logitech: the gate is the onboard profile format rather than a model table. A profile is written only
+  in a format OpenMouse marks writable (2, 3, 4, 7, 8), and DPI only in a format it confirmed on
+  hardware (3, 4, 7, 8); format 2 takes the polling-rate byte only. Other formats are refused.
+- Read back after each write; report a failure in `err` (a user-facing sentence through `TF()`, with
+  placeholders for numbers; the worker thread uses only the copying `T()` / `TF()` overloads).
 - Validate the requested value against `caps` before sending anything.
 - No process access, no hooks, no driver: vendor HID reports to the user's own mouse only.
 

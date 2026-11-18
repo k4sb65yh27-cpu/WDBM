@@ -14,6 +14,8 @@
 > The portable `WirelessBattery.exe`
 > starts with Windows after its first launch (untick *Start with Windows* to stop it). Licensing: see
 > [NOTICE.md](NOTICE.md) (AGPL-3.0-or-later for the combined program). Design: [docs/settings-design.md](docs/settings-design.md).
+> *Request support for a device...* is unchanged from upstream: it sends the data shown in its window
+> to the upstream author's server, and only when you click *Send*.
 
 Battery levels of your wireless mouse, headset, keyboard and controller, right on the Windows taskbar.
 
@@ -49,7 +51,7 @@ Battery levels of your wireless mouse, headset, keyboard and controller, right o
 
 **Tray icons:** one icon per device with the number drawn in it, plus a "Low battery" notification at 15%. The app switches to this automatically when the taskbar is vertical or can't be found.
 
-Hover for details. Click for the menu: every device (click one to hide or show it), display mode, *Refresh now*, *Start with Windows*, and *Exit*. Levels refresh every 60 seconds, and right away when a device is plugged in or the PC wakes up.
+Hover for details. Click for the menu: every device (click one to hide or show it), DPI and polling rate of supported Razer and Logitech mice, display mode, *Refresh now*, *Start with Windows*, and *Exit*. Levels refresh every 60 seconds, and right away when a device is plugged in or the PC wakes up.
 
 ## Supported devices
 
@@ -218,7 +220,7 @@ HeadsetControl release and verifies its checksum. GitHub Actions does all of thi
 pushing a tag like `v1.0.0` publishes a release with the installer, the portable zip and the
 HeadsetControl source (as its GPL license requires).
 
-`WirelessBattery.exe` on its own also works. Without `headsetcontrol.exe` next to it (or on `PATH`) you
+`WirelessBattery.exe` on its own also works. Without `headsetcontrol.exe` next to it you
 just lose the extra headsets.
 
 ## Linux (experimental)
