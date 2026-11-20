@@ -51,6 +51,7 @@ bool GWolvesIsCable(USHORT pid);
 
 // Vendor drivers (run in this order).
 void PollGlorious(PollContext& ctx);  // also Hitscan
+void PollCompxFc05(PollContext& ctx); // Compx 3554:FC05 office-mouse receiver (feature report 06)
 void PollAula(PollContext& ctx);      // AULA F75 / F87 Pro / F99 / HERO 68 Air keyboards (before Kysona)
 void PollDareu(PollContext& ctx);     // DAREU EM901X receiver / cable (split feature/input collections)
 void PollDarmoshark(PollContext& ctx); // Darmoshark M3 over its 2.4 GHz receiver

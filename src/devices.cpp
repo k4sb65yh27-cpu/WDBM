@@ -48,6 +48,7 @@ std::vector<DeviceStatus> PollAllDevices() {
                         }),
                         ctx.colls.end());
     PollGlorious(ctx);
+    PollCompxFc05(ctx);  // exact 3554:FC05 match, before the other 3554 pollers
     PollAula(ctx);       // before Kysona, which shares the 3554 vendor id and would probe it first
     PollDareu(ctx);
     PollDarmoshark(ctx);
